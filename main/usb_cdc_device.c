@@ -55,7 +55,6 @@ esp_err_t usb_cdc_device_init(void)
 
     /* CDC ACM configuration */
     tinyusb_config_cdcacm_t acm_cfg = {
-        .usb_dev = TINYUSB_DEV_DEFAULT,
         .cdc_port = TINYUSB_CDC_ACM_0,
         .rx_unread_buf_sz = 256,
         .callback_rx = &cdc_rx_callback,
