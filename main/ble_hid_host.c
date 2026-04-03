@@ -154,18 +154,6 @@ static int on_svc_discovery(uint16_t chn_conn_handle,
 /* GAP event handler                                                   */
 /* ------------------------------------------------------------------ */
 
-/*
- * Notification callback - receives HID report data from the keyboard.
- */
-static int on_notification(uint16_t chn_conn_handle,
-                           const struct ble_gatt_error *error,
-                           struct ble_gatt_attr *attr,
-                           void *arg)
-{
-    /* This is for subscribe completion, actual notifications come via GAP */
-    return 0;
-}
-
 static int ble_hid_gap_event(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
