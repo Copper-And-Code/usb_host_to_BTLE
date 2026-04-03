@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "ble_hid_host.c"
+        "usb_cdc_device.c"
+        "vt100_keymap.c"
+    INCLUDE_DIRS
+        "."
+    PRIV_REQUIRES
+        bt
+        tinyusb
+        esp_tinyusb
+        nvs_flash
+        esp_event
+)
