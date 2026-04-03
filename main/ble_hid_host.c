@@ -1,8 +1,12 @@
 /*
  * BLE HID Host implementation using NimBLE stack.
  *
- * Flow: scan -> discover HID service -> connect -> subscribe to
- * HID Report characteristic notifications -> deliver reports via callback.
+ * Flow: scan -> discover HID service -> connect -> discover all
+ * characteristics -> sequentially subscribe to HID Report notifications
+ * -> deliver reports via callback.
+ *
+ * NimBLE only supports a limited number of concurrent GATT procedures,
+ * so all discovery and subscription steps are serialized.
  */
 
 #include <string.h>
@@ -39,16 +43,63 @@ static volatile bool is_connected = false;
 /* User callback for keyboard reports */
 static ble_hid_keyboard_cb_t keyboard_callback = NULL;
 
+/* ------------------------------------------------------------------ */
+/* Stored characteristics for sequential subscription                   */
+/* ------------------------------------------------------------------ */
+
+#define MAX_HID_REPORT_CHARS 8
+
+/* Info about a discovered HID Report characteristic */
+typedef struct {
+    uint16_t val_handle;  /* Characteristic value handle */
+    uint16_t end_handle;  /* End of characteristic handle range */
+    uint8_t  properties;  /* Characteristic properties */
+} hid_report_chr_t;
+
+/* HID service handle range */
+static uint16_t hid_svc_start = 0;
+static uint16_t hid_svc_end = 0;
+
+/* Discovered report characteristics */
+static hid_report_chr_t report_chars[MAX_HID_REPORT_CHARS];
+static int num_report_chars = 0;
+
+/* Index of the characteristic currently being subscribed */
+static int subscribe_index = 0;
+
 /* Forward declarations */
 static void ble_hid_scan_start(void);
 static int ble_hid_gap_event(struct ble_gap_event *event, void *arg);
+static void subscribe_next_char(void);
 
 /* ------------------------------------------------------------------ */
-/* GATT discovery and subscription                                     */
+/* Sequential subscription: discover descriptors then write CCCD       */
 /* ------------------------------------------------------------------ */
 
 /*
- * Descriptor discovery callback - find and write CCCD to enable notifications
+ * Callback after CCCD write completes. Move to next characteristic.
+ */
+static int on_cccd_write_complete(uint16_t chn_conn_handle,
+                                  const struct ble_gatt_error *error,
+                                  struct ble_gatt_attr *attr,
+                                  void *arg)
+{
+    if (error->status == 0) {
+        ESP_LOGI(TAG, "Notifications enabled for char index %d", subscribe_index);
+    } else {
+        ESP_LOGW(TAG, "CCCD write failed for char index %d: status=%d",
+                 subscribe_index, error->status);
+    }
+
+    /* Move to next characteristic */
+    subscribe_index++;
+    subscribe_next_char();
+    return 0;
+}
+
+/*
+ * Descriptor discovery callback for one characteristic at a time.
+ * Find the CCCD and write to enable notifications, then proceed to next.
  */
 static int on_dsc_discovery(uint16_t chn_conn_handle,
                             const struct ble_gatt_error *error,
@@ -57,32 +108,85 @@ static int on_dsc_discovery(uint16_t chn_conn_handle,
                             void *arg)
 {
     if (error->status == BLE_HS_EDONE) {
-        return 0; /* Discovery complete */
+        /* No CCCD found for this characteristic, move to next */
+        ESP_LOGD(TAG, "No CCCD found for char index %d, skipping",
+                 subscribe_index);
+        subscribe_index++;
+        subscribe_next_char();
+        return 0;
     }
 
     if (error->status != 0) {
         ESP_LOGE(TAG, "Descriptor discovery error: %d", error->status);
+        subscribe_index++;
+        subscribe_next_char();
         return 0;
     }
 
     /* Check if this is the CCCD */
     if (ble_uuid_cmp(&dsc->uuid.u, &cccd_uuid.u) == 0) {
-        ESP_LOGI(TAG, "Found CCCD at handle 0x%04x, enabling notifications",
-                 dsc->handle);
+        ESP_LOGI(TAG, "Found CCCD at handle 0x%04x for char index %d",
+                 dsc->handle, subscribe_index);
         uint8_t notify_enable[] = {0x01, 0x00}; /* Enable notifications */
         int rc = ble_gattc_write_flat(chn_conn_handle, dsc->handle,
                                       notify_enable, sizeof(notify_enable),
-                                      NULL, NULL);
+                                      on_cccd_write_complete, NULL);
         if (rc != 0) {
-            ESP_LOGE(TAG, "Failed to enable notifications: %d", rc);
+            ESP_LOGE(TAG, "Failed to write CCCD: %d", rc);
+            subscribe_index++;
+            subscribe_next_char();
         }
+        /* Return non-zero to stop descriptor discovery for this char */
+        return BLE_HS_EDONE;
     }
+
     return 0;
 }
 
 /*
- * Characteristic discovery callback - find HID Report characteristics
- * and subscribe for notifications on each one.
+ * Subscribe to the next HID Report characteristic in the queue.
+ * Called after each subscription completes (or is skipped).
+ */
+static void subscribe_next_char(void)
+{
+    while (subscribe_index < num_report_chars) {
+        hid_report_chr_t *chr = &report_chars[subscribe_index];
+
+        /* Only subscribe to characteristics that support notifications */
+        if (!(chr->properties & BLE_GATT_CHR_PROP_NOTIFY)) {
+            ESP_LOGD(TAG, "Char index %d (handle=0x%04x) has no NOTIFY, skipping",
+                     subscribe_index, chr->val_handle);
+            subscribe_index++;
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Subscribing to char index %d (handle=0x%04x)",
+                 subscribe_index, chr->val_handle);
+
+        /* Discover descriptors for this characteristic only */
+        int rc = ble_gattc_disc_all_dscs(conn_handle,
+                                         chr->val_handle,
+                                         chr->end_handle,
+                                         on_dsc_discovery, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to start descriptor discovery: %d", rc);
+            subscribe_index++;
+            continue; /* Try next */
+        }
+        return; /* Wait for callback */
+    }
+
+    ESP_LOGI(TAG, "All HID Report subscriptions complete (%d chars processed)",
+             num_report_chars);
+}
+
+/* ------------------------------------------------------------------ */
+/* GATT discovery (collect characteristics first, subscribe later)      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Characteristic discovery callback - collect all HID Report
+ * characteristics, then start sequential subscription.
  */
 static int on_chr_discovery(uint16_t chn_conn_handle,
                             const struct ble_gatt_error *error,
@@ -90,7 +194,23 @@ static int on_chr_discovery(uint16_t chn_conn_handle,
                             void *arg)
 {
     if (error->status == BLE_HS_EDONE) {
-        ESP_LOGI(TAG, "Characteristic discovery complete");
+        ESP_LOGI(TAG, "Characteristic discovery complete, found %d report chars",
+                 num_report_chars);
+
+        /* Now subscribe to each one sequentially */
+        subscribe_index = 0;
+
+        /* Compute end_handle for each characteristic:
+         * end_handle[i] = val_handle[i+1] - 1 (or svc_end for the last) */
+        for (int i = 0; i < num_report_chars; i++) {
+            if (i + 1 < num_report_chars) {
+                report_chars[i].end_handle = report_chars[i + 1].val_handle - 1;
+            } else {
+                report_chars[i].end_handle = hid_svc_end;
+            }
+        }
+
+        subscribe_next_char();
         return 0;
     }
 
@@ -99,20 +219,19 @@ static int on_chr_discovery(uint16_t chn_conn_handle,
         return 0;
     }
 
-    /* Look for HID Report characteristics that support notifications */
+    /* Collect HID Report characteristics */
     if (ble_uuid_cmp(&chr->uuid.u, &hid_report_uuid.u) == 0) {
         ESP_LOGI(TAG, "Found HID Report char, val_handle=0x%04x, props=0x%02x",
                  chr->val_handle, chr->properties);
 
-        if (chr->properties & BLE_GATT_CHR_PROP_NOTIFY) {
-            /* Discover descriptors to find and write the CCCD */
-            int rc = ble_gattc_disc_all_dscs(chn_conn_handle,
-                                             chr->val_handle,
-                                             0xFFFF,
-                                             on_dsc_discovery, NULL);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "Failed to start descriptor discovery: %d", rc);
-            }
+        if (num_report_chars < MAX_HID_REPORT_CHARS) {
+            report_chars[num_report_chars].val_handle = chr->val_handle;
+            report_chars[num_report_chars].properties = chr->properties;
+            report_chars[num_report_chars].end_handle = hid_svc_end;
+            num_report_chars++;
+        } else {
+            ESP_LOGW(TAG, "Too many report chars, ignoring handle=0x%04x",
+                     chr->val_handle);
         }
     }
     return 0;
@@ -138,6 +257,11 @@ static int on_svc_discovery(uint16_t chn_conn_handle,
 
     ESP_LOGI(TAG, "Found HID service: start=0x%04x end=0x%04x",
              svc->start_handle, svc->end_handle);
+
+    /* Store service range for end_handle calculation */
+    hid_svc_start = svc->start_handle;
+    hid_svc_end = svc->end_handle;
+    num_report_chars = 0;
 
     /* Discover all characteristics within the HID service */
     int rc = ble_gattc_disc_all_chrs(chn_conn_handle,
@@ -254,6 +378,7 @@ static int ble_hid_gap_event(struct ble_gap_event *event, void *arg)
                  event->disconnect.reason);
         conn_handle = BLE_HS_CONN_HANDLE_NONE;
         is_connected = false;
+        num_report_chars = 0;
         /* Restart scanning to reconnect */
         ble_hid_scan_start();
         break;
