@@ -8,8 +8,7 @@ idf_component_register(
         "."
     PRIV_REQUIRES
         bt
-        tinyusb
-        esp_tinyusb
+        usb
         nvs_flash
         esp_event
 )
